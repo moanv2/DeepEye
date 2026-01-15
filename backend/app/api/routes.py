@@ -3,10 +3,15 @@ from sqlalchemy.orm import Session
 from typing import List
 from pydantic import BaseModel
 from datetime import datetime
+import subprocess
+import json
+import os
+from dotenv import load_dotenv
+
 from ..models.database import get_db
 from ..models.scan import Scan, Subdomain
-from ..services.subfinder import run_subfinder
 
+load_dotenv()
 router = APIRouter()
 
 class ScanRequest(BaseModel):
@@ -31,6 +36,87 @@ class ScanResponse(BaseModel):
     class Config:
         from_attributes = True
 
+
+# ============== SCANNER FUNCTIONS ==============
+
+def run_subfinder(domain: str) -> list[str]:
+    """Run Subfinder to discover subdomains."""
+
+    api_key = os.getenv("PDCP_API_KEY", "")
+
+    cmd = [
+        "docker", "run", "--rm",
+        "-e", f"PDCP_API_KEY={api_key}",
+        "projectdiscovery/subfinder",
+        "-d", domain,
+        "-silent"
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    subdomains = [line for line in result.stdout.strip().split("\n") if line]
+    return subdomains
+
+
+def run_httpx(subdomains: list[str]) -> list[dict]:
+    """Run httpx to get IPs and status codes."""
+
+    if not subdomains:
+        return []
+
+    input_data = "\n".join(subdomains)
+
+    cmd = [
+        "docker", "run", "--rm", "-i",
+        "projectdiscovery/httpx",
+        "-silent",
+        "-json",
+        "-ip"
+    ]
+
+    result = subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+
+    results = []
+    for line in result.stdout.strip().split("\n"):
+        if line:
+            try:
+                data = json.loads(line)
+                results.append({
+                    "subdomain": data.get("input", ""),
+                    "ip_address": data.get("host", None),
+                    "status_code": data.get("status_code", None),
+                    "url": data.get("url", "")
+                })
+            except json.JSONDecodeError:
+                continue
+
+    return results
+
+
+def scan_domain(domain: str) -> list[dict]:
+    """Full scan: Subfinder → httpx."""
+
+    # Step 1: Discover subdomains
+    subdomains = run_subfinder(domain)
+
+    # Step 2: Probe for IPs and status
+    results = run_httpx(subdomains)
+
+    # Include subdomains that httpx didn't reach
+    probed = {r["subdomain"] for r in results}
+    for sub in subdomains:
+        if sub not in probed:
+            results.append({
+                "subdomain": sub,
+                "ip_address": None,
+                "status_code": None,
+                "url": None
+            })
+
+    return results
+
+
+# ============== API ROUTES ==============
+
 @router.post("/scan", response_model=ScanResponse)
 def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
     """Start a new scan for a domain."""
@@ -41,8 +127,8 @@ def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(scan)
 
-    # Run Subfinder
-    results = run_subfinder(request.domain)
+    # Run full scan (Subfinder + httpx)
+    results = scan_domain(request.domain)
 
     # Save subdomains
     for item in results:
