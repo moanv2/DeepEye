@@ -80,17 +80,22 @@ def run_httpx(subdomains: list[str]) -> list[dict]:
         if line:
             try:
                 data = json.loads(line)
+
+                # Get IP from host_ip or first A record
+                ip = data.get("host_ip")
+                if not ip and data.get("a"):
+                    ip = data["a"][0]
+
                 results.append({
                     "subdomain": data.get("input", ""),
-                    "ip_address": data.get("host", None),
-                    "status_code": data.get("status_code", None),
+                    "ip_address": ip,
+                    "status_code": data.get("status_code"),
                     "url": data.get("url", "")
                 })
             except json.JSONDecodeError:
                 continue
 
     return results
-
 
 def scan_domain(domain: str) -> list[dict]:
     """Full scan: Subfinder → httpx."""
