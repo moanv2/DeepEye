@@ -14,12 +14,16 @@ from ..models.scan import Scan, Subdomain
 load_dotenv()
 router = APIRouter()
 
+
+# pydantic models
+
 class ScanRequest(BaseModel):
     domain: str
 
 class SubdomainResponse(BaseModel):
     subdomain: str
     ip_address: str | None
+    host_status: int  # 0=dead, 1=alive, 2=unknown
     discovered_at: datetime
 
     class Config:
@@ -32,12 +36,14 @@ class ScanResponse(BaseModel):
     progress: int
     created_at: datetime
     subdomains_count: int
+    alive_count: int
+    dead_count: int
 
     class Config:
         from_attributes = True
 
 
-# ============== SCANNER FUNCTIONS ==============
+# scanner functions
 
 def run_subfinder(domain: str) -> list[str]:
     """Run Subfinder to discover subdomains."""
@@ -80,16 +86,28 @@ def run_httpx(subdomains: list[str]) -> list[dict]:
         if line:
             try:
                 data = json.loads(line)
-
-                # Get IP from host_ip or first A record
                 ip = data.get("host_ip")
                 if not ip and data.get("a"):
                     ip = data["a"][0]
 
+                status_code = data.get("status_code")
+
+                # Determine host_status: 1=alive, 0=dead
+                # Alive: 2xx, 3xx, 4xx (server responded)
+                # Dead: 5xx or no response
+                if status_code:
+                    if status_code >= 500:
+                        host_status = 0  # Dead (server error)
+                    else:
+                        host_status = 1  # Alive (responded)
+                else:
+                    host_status = 0  # Dead (no response)
+
                 results.append({
                     "subdomain": data.get("input", ""),
                     "ip_address": ip,
-                    "status_code": data.get("status_code"),
+                    "host_status": host_status,
+                    "status_code": status_code,
                     "url": data.get("url", "")
                 })
             except json.JSONDecodeError:
@@ -97,30 +115,32 @@ def run_httpx(subdomains: list[str]) -> list[dict]:
 
     return results
 
+
 def scan_domain(domain: str) -> list[dict]:
-    """Full scan: Subfinder → httpx."""
+    """Full scan: Subfinder and httpx."""
 
     # Step 1: Discover subdomains
     subdomains = run_subfinder(domain)
 
     # Step 2: Probe for IPs and status
-    results = run_httpx(subdomains)
+    httpx_results = run_httpx(subdomains)
 
-    # Include subdomains that httpx didn't reach
-    probed = {r["subdomain"] for r in results}
+    # Include subdomains that httpx didn't reach (unknown status)
+    probed = {r["subdomain"] for r in httpx_results}
     for sub in subdomains:
         if sub not in probed:
-            results.append({
+            httpx_results.append({
                 "subdomain": sub,
                 "ip_address": None,
+                "host_status": 2,  # Unknown
                 "status_code": None,
                 "url": None
             })
 
-    return results
+    return httpx_results
 
 
-# ============== API ROUTES ==============
+# API routes
 
 @router.post("/scan", response_model=ScanResponse)
 def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
@@ -132,15 +152,20 @@ def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(scan)
 
-    # Run full scan (Subfinder + httpx)
+    # Run full scan
     results = scan_domain(request.domain)
+
+    # Count stats
+    alive_count = sum(1 for r in results if r["host_status"] == 1)
+    dead_count = sum(1 for r in results if r["host_status"] == 0)
 
     # Save subdomains
     for item in results:
         subdomain = Subdomain(
             scan_id=scan.id,
             subdomain=item["subdomain"],
-            ip_address=item["ip_address"]
+            ip_address=item["ip_address"],
+            host_status=item["host_status"]
         )
         db.add(subdomain)
 
@@ -157,7 +182,9 @@ def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
         status=scan.status,
         progress=scan.progress,
         created_at=scan.created_at,
-        subdomains_count=len(results)
+        subdomains_count=len(results),
+        alive_count=alive_count,
+        dead_count=dead_count
     )
 
 
@@ -167,3 +194,20 @@ def get_subdomains(scan_id: str, db: Session = Depends(get_db)):
 
     subdomains = db.query(Subdomain).filter(Subdomain.scan_id == scan_id).all()
     return subdomains
+
+
+@router.get("/scans")
+def list_scans(db: Session = Depends(get_db)):
+    """List all scans."""
+
+    scans = db.query(Scan).order_by(Scan.created_at.desc()).all()
+    return [
+        {
+            "id": str(scan.id),
+            "domain": scan.domain,
+            "status": scan.status,
+            "progress": scan.progress,
+            "created_at": scan.created_at
+        }
+        for scan in scans
+    ]
