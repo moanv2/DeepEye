@@ -15,19 +15,23 @@ load_dotenv()
 router = APIRouter()
 
 
-# pydantic models
+# ============== PYDANTIC MODELS ==============
 
 class ScanRequest(BaseModel):
     domain: str
 
+
 class SubdomainResponse(BaseModel):
     subdomain: str
     ip_address: str | None
-    host_status: int  # 0=dead, 1=alive, 2=unknown
+    host_status: int
+    asn: str | None
+    asn_org: str | None
     discovered_at: datetime
 
     class Config:
         from_attributes = True
+
 
 class ScanResponse(BaseModel):
     id: str
@@ -43,11 +47,10 @@ class ScanResponse(BaseModel):
         from_attributes = True
 
 
-# scanner functions
+# ============== SCANNER FUNCTIONS ==============
 
 def run_subfinder(domain: str) -> list[str]:
     """Run Subfinder to discover subdomains."""
-
     api_key = os.getenv("PDCP_API_KEY", "")
 
     cmd = [
@@ -60,12 +63,12 @@ def run_subfinder(domain: str) -> list[str]:
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     subdomains = [line for line in result.stdout.strip().split("\n") if line]
+    print(f"[DEBUG] Subfinder found {len(subdomains)} subdomains")
     return subdomains
 
 
 def run_httpx(subdomains: list[str]) -> list[dict]:
     """Run httpx to get IPs and status codes."""
-
     if not subdomains:
         return []
 
@@ -92,16 +95,14 @@ def run_httpx(subdomains: list[str]) -> list[dict]:
 
                 status_code = data.get("status_code")
 
-                # Determine host_status: 1=alive, 0=dead
-                # Alive: 2xx, 3xx, 4xx (server responded)
-                # Dead: 5xx or no response
+                # Determine host_status
                 if status_code:
                     if status_code >= 500:
-                        host_status = 0  # Dead (server error)
+                        host_status = 0
                     else:
-                        host_status = 1  # Alive (responded)
+                        host_status = 1
                 else:
-                    host_status = 0  # Dead (no response)
+                    host_status = 0
 
                 results.append({
                     "subdomain": data.get("input", ""),
@@ -113,11 +114,56 @@ def run_httpx(subdomains: list[str]) -> list[dict]:
             except json.JSONDecodeError:
                 continue
 
+    print(f"[DEBUG] httpx probed {len(results)} hosts")
     return results
 
 
-def scan_domain(domain: str) -> list[dict]:
-    """Full scan: Subfinder and httpx."""
+def run_asnmap(ips: list[str]) -> dict:
+    """Run ASNmap to get ASN info for IPs."""
+    if not ips:
+        print("[DEBUG] No IPs to lookup for ASN")
+        return {}
+
+    api_key = os.getenv("PDCP_API_KEY", "")
+    input_data = "\n".join(ips)
+
+    print(f"[DEBUG] Looking up ASN for {len(ips)} IPs: {ips[:5]}...")
+
+    cmd = [
+        "docker", "run", "--rm", "-i",
+        "-e", f"PDCP_API_KEY={api_key}",
+        "projectdiscovery/asnmap",
+        "-silent",
+        "-json"
+    ]
+
+    result = subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+
+    print(f"[DEBUG] ASNmap stdout: {result.stdout[:500]}")
+    print(f"[DEBUG] ASNmap stderr: {result.stderr[:500]}")
+
+    asn_map = {}
+    for line in result.stdout.strip().split("\n"):
+        if line:
+            try:
+                data = json.loads(line)
+                print(f"[DEBUG] ASN data: {data}")
+                ip = data.get("input", "")
+                asn_map[ip] = {
+                    "asn": str(data.get("as_number", "")),
+                    "asn_org": data.get("as_name", ""),
+                    "country": data.get("country", "")
+                }
+            except json.JSONDecodeError as e:
+                print(f"[DEBUG] JSON decode error: {e}")
+                continue
+
+    print(f"[DEBUG] ASN map result: {asn_map}")
+    return asn_map
+
+
+def scan_domain(domain: str) -> dict:
+    """Full scan: Subfinder → httpx → ASNmap."""
 
     # Step 1: Discover subdomains
     subdomains = run_subfinder(domain)
@@ -125,22 +171,41 @@ def scan_domain(domain: str) -> list[dict]:
     # Step 2: Probe for IPs and status
     httpx_results = run_httpx(subdomains)
 
-    # Include subdomains that httpx didn't reach (unknown status)
+    # Step 3: Get ASN info for discovered IPs
+    ips = list(set([r["ip_address"] for r in httpx_results if r["ip_address"]]))
+    asn_map = run_asnmap(ips)
+
+    # Combine results - INCLUDE host_status
+    combined_subdomains = []
+    for result in httpx_results:
+        ip = result["ip_address"]
+        asn_info = asn_map.get(ip, {})
+        combined_subdomains.append({
+            "subdomain": result["subdomain"],
+            "ip_address": ip,
+            "host_status": result["host_status"],  # <-- This was missing!
+            "asn": asn_info.get("asn"),
+            "asn_org": asn_info.get("asn_org"),
+        })
+
+    # Include subdomains that httpx didn't reach
     probed = {r["subdomain"] for r in httpx_results}
     for sub in subdomains:
         if sub not in probed:
-            httpx_results.append({
+            combined_subdomains.append({
                 "subdomain": sub,
                 "ip_address": None,
                 "host_status": 2,  # Unknown
-                "status_code": None,
-                "url": None
+                "asn": None,
+                "asn_org": None,
             })
 
-    return httpx_results
+    return {
+        "subdomains": combined_subdomains
+    }
 
 
-# API routes
+# ============== API ROUTES ==============
 
 @router.post("/scan", response_model=ScanResponse)
 def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
@@ -156,16 +221,18 @@ def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
     results = scan_domain(request.domain)
 
     # Count stats
-    alive_count = sum(1 for r in results if r["host_status"] == 1)
-    dead_count = sum(1 for r in results if r["host_status"] == 0)
+    alive_count = sum(1 for r in results["subdomains"] if r["host_status"] == 1)
+    dead_count = sum(1 for r in results["subdomains"] if r["host_status"] == 0)
 
     # Save subdomains
-    for item in results:
+    for item in results["subdomains"]:
         subdomain = Subdomain(
             scan_id=scan.id,
             subdomain=item["subdomain"],
             ip_address=item["ip_address"],
-            host_status=item["host_status"]
+            host_status=item["host_status"],
+            asn=item["asn"],
+            asn_org=item["asn_org"]
         )
         db.add(subdomain)
 
@@ -182,7 +249,7 @@ def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
         status=scan.status,
         progress=scan.progress,
         created_at=scan.created_at,
-        subdomains_count=len(results),
+        subdomains_count=len(results["subdomains"]),
         alive_count=alive_count,
         dead_count=dead_count
     )
@@ -191,7 +258,6 @@ def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
 @router.get("/scan/{scan_id}/subdomains", response_model=List[SubdomainResponse])
 def get_subdomains(scan_id: str, db: Session = Depends(get_db)):
     """Get all subdomains for a scan."""
-
     subdomains = db.query(Subdomain).filter(Subdomain.scan_id == scan_id).all()
     return subdomains
 
@@ -199,7 +265,6 @@ def get_subdomains(scan_id: str, db: Session = Depends(get_db)):
 @router.get("/scans")
 def list_scans(db: Session = Depends(get_db)):
     """List all scans."""
-
     scans = db.query(Scan).order_by(Scan.created_at.desc()).all()
     return [
         {
