@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from typing import List
 from pydantic import BaseModel
 from datetime import datetime
@@ -22,6 +23,7 @@ class ScanRequest(BaseModel):
 
 
 class SubdomainResponse(BaseModel):
+    row_num: int
     subdomain: str
     ip_address: str | None
     host_status: int
@@ -255,11 +257,35 @@ def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
     )
 
 
-@router.get("/scan/{scan_id}/subdomains", response_model=List[SubdomainResponse])
+
+
+@router.get("/scan/{scan_id}/subdomains")
 def get_subdomains(scan_id: str, db: Session = Depends(get_db)):
-    """Get all subdomains for a scan."""
-    subdomains = db.query(Subdomain).filter(Subdomain.scan_id == scan_id).all()
-    return subdomains
+    """Get all subdomains for a scan with row numbers."""
+
+    query = db.execute(text("""
+        SELECT 
+            ROW_NUMBER() OVER (ORDER BY discovered_at) as row_num,
+            id, subdomain, ip_address, host_status, asn, asn_org, discovered_at
+        FROM subdomains
+        WHERE scan_id = :scan_id
+        ORDER BY discovered_at
+    """), {"scan_id": scan_id})
+
+    results = []
+    for row in query:
+        results.append({
+            "row_num": row.row_num,
+            "id": str(row.id),
+            "subdomain": row.subdomain,
+            "ip_address": row.ip_address,
+            "host_status": row.host_status,
+            "asn": row.asn,
+            "asn_org": row.asn_org,
+            "discovered_at": row.discovered_at
+        })
+
+    return results
 
 
 @router.get("/scans")
