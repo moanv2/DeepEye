@@ -51,3 +51,6 @@ class Endpoint(Base):
     discovered_at = Column(DateTime, default=datetime.utcnow)
 
     scan = relationship("Scan", back_populates="endpoints")
+
+
+# Error for crashing when executing is in POST /api/scan
