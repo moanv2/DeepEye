@@ -505,3 +505,7 @@ def list_scans(db: Session = Depends(get_db)):
         }
         for row in query
     ]
+
+
+# Tomorrow, review the POST /api/scan endpoint and make sure code works
+# Also, make sure the endpoints table is filled when we scan
