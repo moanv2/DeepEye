@@ -185,6 +185,7 @@ def run_asnmap(ips: list[str]) -> dict:
 
     print(f"[DEBUG] Looking up ASN for {len(ips)} IPs")
 
+    # Double check if the parameters are correct, check flags to see if they are correct
     cmd = [
         "docker", "run", "--rm", "-i",
         "-e", f"PDCP_API_KEY={api_key}",
@@ -209,6 +210,7 @@ def run_asnmap(ips: list[str]) -> dict:
             except json.JSONDecodeError:
                 continue
 
+    # Do we stll need this or are we done debugging?
     print(f"[DEBUG] ASNmap resolved {len(asn_map)} IPs")
     return asn_map
 
