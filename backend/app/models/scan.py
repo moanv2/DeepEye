@@ -31,7 +31,7 @@ class Subdomain(Base):
     ip_address = Column(String(45), nullable=True)
     host_status = Column(Integer, default=2)  # 0=dead, 1=alive, 2=unknown
     discovered_at = Column(DateTime, default=datetime.utcnow)
-    asn = Column(String(20), nullable=True)
+    asn = Column(String(20), nullable=True)         # double-check the ASN as it's not showing when scanning
     asn_org = Column(String(225), nullable=True)
 
     scan = relationship("Scan", back_populates="subdomains")
