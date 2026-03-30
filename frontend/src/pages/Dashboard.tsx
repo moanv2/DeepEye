@@ -7,13 +7,15 @@ import ScanList from "../components/ScanList";
 export default function Dashboard() {
   const [scans, setScans] = useState<Scan[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const fetchScans = useCallback(async () => {
     try {
+      setError(null);
       const data = await getScans();
       setScans(data);
-    } catch {
-      // silently fail — list stays empty
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load scans");
     } finally {
       setLoading(false);
     }
@@ -47,7 +49,10 @@ export default function Dashboard() {
         <h2 className="mb-3 text-sm font-semibold text-gray-300 uppercase tracking-wide">
           Scan History
         </h2>
-        <ScanList scans={scans} loading={loading} />
+        {error
+          ? <p className="text-red-400 text-sm">{error}</p>
+          : <ScanList scans={scans} loading={loading} />
+        }
       </section>
     </div>
   );
