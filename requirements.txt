@@ -1,0 +1,16 @@
+# Backend (Python)
+fastapi==0.109.0
+uvicorn==0.27.0
+sqlalchemy==2.0.25
+psycopg2-binary==2.9.9
+redis==5.0.1
+celery==5.3.4
+pydantic==2.5.3
+python-dotenv==1.0.0
+websockets==12.0
+
+# Frontend (Node.js) — install separately via: cd frontend && npm install
+# See frontend/package.json for full list:
+#   react 19, react-dom 19, react-router-dom 7
+#   axios, lucide-react, three
+#   vite 7, typescript 5.9, tailwindcss 4, eslint 9
