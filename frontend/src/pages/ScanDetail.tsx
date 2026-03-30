@@ -19,22 +19,26 @@ export default function ScanDetail() {
   const [loadingEp, setLoadingEp] = useState(true);
   const [loadingSens, setLoadingSens] = useState(true);
 
+  const [errorSub, setErrorSub] = useState<string | null>(null);
+  const [errorEp, setErrorEp] = useState<string | null>(null);
+  const [errorSens, setErrorSens] = useState<string | null>(null);
+
   useEffect(() => {
     if (!scanId) return;
 
     getSubdomains(scanId)
       .then(setSubdomains)
-      .catch(() => {})
+      .catch((err) => setErrorSub(err instanceof Error ? err.message : "Failed to load subdomains"))
       .finally(() => setLoadingSub(false));
 
     getEndpoints(scanId)
       .then(setEndpoints)
-      .catch(() => {})
+      .catch((err) => setErrorEp(err instanceof Error ? err.message : "Failed to load endpoints"))
       .finally(() => setLoadingEp(false));
 
     getSensitiveEndpoints(scanId)
       .then(setSensitive)
-      .catch(() => {})
+      .catch((err) => setErrorSens(err instanceof Error ? err.message : "Failed to load sensitive endpoints"))
       .finally(() => setLoadingSens(false));
   }, [scanId]);
 
@@ -75,15 +79,21 @@ export default function ScanDetail() {
 
       <div className="rounded-lg border border-gray-800 bg-gray-900 p-4">
         {tab === "subdomains" && (
-          <SubdomainTable subdomains={subdomains} loading={loadingSub} />
+          errorSub
+            ? <p className="text-red-400 text-sm">{errorSub}</p>
+            : <SubdomainTable subdomains={subdomains} loading={loadingSub} />
         )}
 
         {tab === "endpoints" && (
-          <EndpointTable endpoints={endpoints} loading={loadingEp} />
+          errorEp
+            ? <p className="text-red-400 text-sm">{errorEp}</p>
+            : <EndpointTable endpoints={endpoints} loading={loadingEp} />
         )}
 
         {tab === "sensitive" && (
-          <SensitiveTab sensitive={sensitive} loading={loadingSens} />
+          errorSens
+            ? <p className="text-red-400 text-sm">{errorSens}</p>
+            : <SensitiveTab sensitive={sensitive} loading={loadingSens} />
         )}
       </div>
     </div>
