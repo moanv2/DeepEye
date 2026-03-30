@@ -3,11 +3,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import List
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 import subprocess
 import json
 import os
+import logging
 from dotenv import load_dotenv
 
 from ..models.database import get_db
@@ -15,6 +16,7 @@ from ..models.scan import Scan, Subdomain, Endpoint
 
 load_dotenv()
 router = APIRouter()
+logger = logging.getLogger("deepeye")
 
 # ============== SENSITIVE PATH DETECTION ==============
 
@@ -56,7 +58,7 @@ def extract_path(url: str) -> str:
     try:
         parsed = urlparse(url)
         return parsed.path or "/"
-    except:
+    except (ValueError, AttributeError):
         return "/"
 
 
@@ -116,13 +118,27 @@ def run_subfinder(domain: str) -> list[str]:
         "-e", f"PDCP_API_KEY={api_key}",
         "projectdiscovery/subfinder",
         "-d", domain,
-        "-silent"
+        "-silent",
+        "-timeout", "30"
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    subdomains = [line for line in result.stdout.strip().split("\n") if line]
-    print(f"[DEBUG] Subfinder found {len(subdomains)} subdomains")
-    return subdomains
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            logger.error("Subfinder failed (exit %d): %s", result.returncode, result.stderr.strip())
+            return []
+        subdomains = [line for line in result.stdout.strip().split("\n") if line]
+        logger.info("Subfinder found %d subdomains for %s", len(subdomains), domain)
+        return subdomains
+    except subprocess.TimeoutExpired:
+        logger.error("Subfinder timed out for domain %s", domain)
+        return []
+    except FileNotFoundError:
+        logger.error("Docker is not installed or not in PATH")
+        return []
+    except Exception as e:
+        logger.error("Subfinder unexpected error: %s", e)
+        return []
 
 
 def run_httpx(subdomains: list[str]) -> list[dict]:
@@ -137,10 +153,24 @@ def run_httpx(subdomains: list[str]) -> list[dict]:
         "projectdiscovery/httpx",
         "-silent",
         "-json",
-        "-ip"
+        "-ip",
+        "-timeout", "15"
     ]
 
-    result = subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, input=input_data, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            logger.error("httpx failed (exit %d): %s", result.returncode, result.stderr.strip())
+            return []
+    except subprocess.TimeoutExpired:
+        logger.error("httpx timed out for %d subdomains", len(subdomains))
+        return []
+    except FileNotFoundError:
+        logger.error("Docker is not installed or not in PATH")
+        return []
+    except Exception as e:
+        logger.error("httpx unexpected error: %s", e)
+        return []
 
     results = []
     for line in result.stdout.strip().split("\n"):
@@ -169,9 +199,10 @@ def run_httpx(subdomains: list[str]) -> list[dict]:
                     "url": data.get("url", "")
                 })
             except json.JSONDecodeError:
+                logger.warning("httpx: skipping malformed JSON line")
                 continue
 
-    print(f"[DEBUG] httpx probed {len(results)} hosts")
+    logger.info("httpx probed %d hosts", len(results))
     return results
 
 
@@ -183,18 +214,31 @@ def run_asnmap(ips: list[str]) -> dict:
     api_key = os.getenv("PDCP_API_KEY", "")
     input_data = "\n".join(ips)
 
-    print(f"[DEBUG] Looking up ASN for {len(ips)} IPs")
+    logger.info("Looking up ASN for %d IPs", len(ips))
 
-    # Double check if the parameters are correct, check flags to see if they are correct
     cmd = [
         "docker", "run", "--rm", "-i",
         "-e", f"PDCP_API_KEY={api_key}",
         "projectdiscovery/asnmap",
         "-silent",
-        "-json"
+        "-json",
+        "-timeout", "30"
     ]
 
-    result = subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, input=input_data, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            logger.error("ASNmap failed (exit %d): %s", result.returncode, result.stderr.strip())
+            return {}
+    except subprocess.TimeoutExpired:
+        logger.error("ASNmap timed out for %d IPs", len(ips))
+        return {}
+    except FileNotFoundError:
+        logger.error("Docker is not installed or not in PATH")
+        return {}
+    except Exception as e:
+        logger.error("ASNmap unexpected error: %s", e)
+        return {}
 
     asn_map = {}
     for line in result.stdout.strip().split("\n"):
@@ -208,10 +252,10 @@ def run_asnmap(ips: list[str]) -> dict:
                     "country": data.get("as_country", "")
                 }
             except json.JSONDecodeError:
+                logger.warning("ASNmap: skipping malformed JSON line")
                 continue
 
-    # Do we stll need this or are we done debugging?
-    print(f"[DEBUG] ASNmap resolved {len(asn_map)} IPs")
+    logger.info("ASNmap resolved %d of %d IPs", len(asn_map), len(ips))
     return asn_map
 
 
@@ -220,22 +264,36 @@ def run_katana(urls: list[str], max_urls: int = 10) -> list[dict]:
     if not urls:
         return []
 
-    # Limit URLs to avoid long scans
     urls_to_scan = urls[:max_urls]
     input_data = "\n".join(urls_to_scan)
 
-    print(f"[DEBUG] Running Katana on {len(urls_to_scan)} URLs")
+    logger.info("Running Katana on %d URLs", len(urls_to_scan))
 
     cmd = [
         "docker", "run", "--rm", "-i",
         "projectdiscovery/katana",
         "-silent",
-        "-json",
+        "-jsonl",
         "-depth", "2",
-        "-jc"
+        "-jc",
+        "-omit-body",
+        "-timeout", "15"
     ]
 
-    result = subprocess.run(cmd, input=input_data, capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, input=input_data, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            logger.error("Katana failed (exit %d): %s", result.returncode, result.stderr.strip())
+            return []
+    except subprocess.TimeoutExpired:
+        logger.error("Katana timed out for %d URLs", len(urls_to_scan))
+        return []
+    except FileNotFoundError:
+        logger.error("Docker is not installed or not in PATH")
+        return []
+    except Exception as e:
+        logger.error("Katana unexpected error: %s", e)
+        return []
 
     endpoints = []
     seen_urls = set()
@@ -245,24 +303,15 @@ def run_katana(urls: list[str], max_urls: int = 10) -> list[dict]:
             try:
                 data = json.loads(line)
 
-                # Handle different JSON structures
                 url = data.get("request", {}).get("endpoint", "") or data.get("endpoint", "")
 
-                if not url:
-                    continue
-
-                if url in seen_urls:
+                if not url or url in seen_urls:
                     continue
 
                 seen_urls.add(url)
 
-                # Check if sensitive
                 is_sensitive, reason = check_sensitive(url)
-
-                # Get status code
                 status_code = data.get("response", {}).get("status_code") or data.get("status_code")
-
-                # Get method
                 method = data.get("request", {}).get("method", "GET") or data.get("method", "GET")
 
                 endpoints.append({
@@ -275,10 +324,11 @@ def run_katana(urls: list[str], max_urls: int = 10) -> list[dict]:
                 })
 
             except json.JSONDecodeError:
+                logger.warning("Katana: skipping malformed JSON line")
                 continue
 
-    print(
-        f"[DEBUG] Katana found {len(endpoints)} endpoints, {sum(1 for e in endpoints if e['is_sensitive'])} sensitive")
+    sensitive_count = sum(1 for e in endpoints if e["is_sensitive"])
+    logger.info("Katana found %d endpoints (%d sensitive)", len(endpoints), sensitive_count)
     return endpoints
 
 
@@ -342,63 +392,70 @@ def create_scan(request: ScanRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(scan)
 
-    # Run full scan
-    results = scan_domain(request.domain)
+    try:
+        results = scan_domain(request.domain)
 
-    # Count stats
-    alive_count = sum(1 for r in results["subdomains"] if r["host_status"] == 1)
-    dead_count = sum(1 for r in results["subdomains"] if r["host_status"] == 0)
-    sensitive_count = sum(1 for e in results["endpoints"] if e["is_sensitive"])
+        alive_count = sum(1 for r in results["subdomains"] if r["host_status"] == 1)
+        dead_count = sum(1 for r in results["subdomains"] if r["host_status"] == 0)
+        sensitive_count = sum(1 for e in results["endpoints"] if e["is_sensitive"])
 
-    # Save subdomains
-    for item in results["subdomains"]:
-        subdomain = Subdomain(
-            scan_id=scan.id,
-            subdomain=item["subdomain"],
-            ip_address=item["ip_address"],
-            host_status=item["host_status"],
-            asn=item["asn"],
-            asn_org=item["asn_org"]
+        for item in results["subdomains"]:
+            subdomain = Subdomain(
+                scan_id=scan.id,
+                subdomain=item["subdomain"],
+                ip_address=item["ip_address"],
+                host_status=item["host_status"],
+                asn=item["asn"],
+                asn_org=item["asn_org"]
+            )
+            db.add(subdomain)
+
+        for item in results["endpoints"]:
+            endpoint = Endpoint(
+                scan_id=scan.id,
+                url=item["url"],
+                path=item["path"],
+                method=item["method"],
+                status_code=item["status_code"],
+                is_sensitive=item["is_sensitive"],
+                sensitivity_reason=item["sensitivity_reason"]
+            )
+            db.add(endpoint)
+
+        scan.status = "completed"
+        scan.progress = 100
+        scan.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(scan)
+
+        logger.info("Scan completed for %s: %d subdomains, %d endpoints", request.domain, len(results["subdomains"]), len(results["endpoints"]))
+
+        return ScanResponse(
+            id=str(scan.id),
+            domain=scan.domain,
+            status=scan.status,
+            progress=scan.progress,
+            created_at=scan.created_at,
+            subdomains_count=len(results["subdomains"]),
+            alive_count=alive_count,
+            dead_count=dead_count,
+            endpoints_count=len(results["endpoints"]),
+            sensitive_count=sensitive_count
         )
-        db.add(subdomain)
-
-    # Save endpoints
-    for item in results["endpoints"]:
-        endpoint = Endpoint(
-            scan_id=scan.id,
-            url=item["url"],
-            path=item["path"],
-            method=item["method"],
-            status_code=item["status_code"],
-            is_sensitive=item["is_sensitive"],
-            sensitivity_reason=item["sensitivity_reason"]
-        )
-        db.add(endpoint)
-
-    # Update scan status
-    scan.status = "completed"
-    scan.progress = 100
-    scan.completed_at = datetime.utcnow()
-    db.commit()
-    db.refresh(scan)
-
-    return ScanResponse(
-        id=str(scan.id),
-        domain=scan.domain,
-        status=scan.status,
-        progress=scan.progress,
-        created_at=scan.created_at,
-        subdomains_count=len(results["subdomains"]),
-        alive_count=alive_count,
-        dead_count=dead_count,
-        endpoints_count=len(results["endpoints"]),
-        sensitive_count=sensitive_count
-    )
+    except Exception as e:
+        logger.error("Scan failed for %s: %s", request.domain, e)
+        scan.status = "failed"
+        scan.completed_at = datetime.now(timezone.utc)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
 
 
 @router.get("/scan/{scan_id}/subdomains", response_model=List[SubdomainResponse])
 def get_subdomains(scan_id: str, db: Session = Depends(get_db)):
     """Get all subdomains for a scan with row numbers."""
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
 
     query = db.execute(text("""
         SELECT 
@@ -428,6 +485,9 @@ def get_subdomains(scan_id: str, db: Session = Depends(get_db)):
 @router.get("/scan/{scan_id}/endpoints", response_model=List[EndpointResponse])
 def get_endpoints(scan_id: str, db: Session = Depends(get_db)):
     """Get all endpoints for a scan with row numbers."""
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
 
     query = db.execute(text("""
         SELECT 
@@ -458,6 +518,9 @@ def get_endpoints(scan_id: str, db: Session = Depends(get_db)):
 @router.get("/scan/{scan_id}/sensitive")
 def get_sensitive_endpoints(scan_id: str, db: Session = Depends(get_db)):
     """Get only sensitive endpoints for a scan."""
+    scan = db.query(Scan).filter(Scan.id == scan_id).first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
 
     query = db.execute(text("""
         SELECT url, path, sensitivity_reason, status_code
@@ -507,7 +570,3 @@ def list_scans(db: Session = Depends(get_db)):
         }
         for row in query
     ]
-
-
-# Tomorrow, review the POST /api/scan endpoint and make sure code works
-# Also, make sure the endpoints table is filled when we scan
